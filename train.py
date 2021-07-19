@@ -24,7 +24,7 @@ from stft_loss import MultiResolutionSTFTLoss
 torch.backends.cudnn.benchmark = True
 
 
-def train(rank, a, h):
+def train(rank, a, h, warm_start):
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
@@ -55,8 +55,12 @@ def train(rank, a, h):
         generator.load_state_dict(state_dict_g['generator'])
         mpd.load_state_dict(state_dict_do['mpd'])
         msd.load_state_dict(state_dict_do['msd'])
-        steps = state_dict_do['steps'] + 1
-        last_epoch = state_dict_do['epoch']
+        if warm_start:
+            steps = 1
+            last_epoch = 0
+        else:
+            steps = state_dict_do['steps'] + 1
+            last_epoch = state_dict_do['epoch']
 
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
@@ -67,9 +71,12 @@ def train(rank, a, h):
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
 
-    if state_dict_do is not None:
+    if state_dict_do is not None or warm_start:
         optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
+    if warm_start:
+        optim_g.param_groups[0]["lr"] = h.learning_rate
+        optim_d.param_groups[0]["lr"] = h.learning_rate
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
@@ -106,6 +113,8 @@ def train(rank, a, h):
     mpd.train()
     msd.train()
     for epoch in range(max(0, last_epoch), a.training_epochs):
+        for param_group in optim_g.param_groups:
+            print("Current learning rate: " + str(param_group["lr"]))
         if rank == 0:
             start = time.time()
             print("Epoch: {}".format(epoch + 1))
@@ -198,7 +207,7 @@ def train(rank, a, h):
                     sw.add_scalar("training/mel_spec_error", mel_error, steps)
 
                 # Validation
-                if steps % a.validation_interval == 0:  # and steps != 0:
+                if steps % a.validation_interval == 0 and not a.fine_tuning:  # and steps != 0:
                     generator.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
@@ -256,6 +265,7 @@ def main():
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--warm_start', default=False, type=bool)
 
     a = parser.parse_args()
 
@@ -276,9 +286,9 @@ def main():
         pass
 
     if h.num_gpus > 1:
-        mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
+        mp.spawn(train, nprocs=h.num_gpus, args=(a, h, a.warm_start,))
     else:
-        train(0, a, h)
+        train(0, a, h, a.warm_start)
 
 
 if __name__ == '__main__':
